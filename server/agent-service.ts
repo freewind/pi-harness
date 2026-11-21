@@ -2644,11 +2644,11 @@ export class ClientSession {
 			for (const { client, conv } of owners) {
 				if (client.cwdSwitchRunning) throw new Error("该对话正在其他窗口中切换工作区，请稍后重试");
 				const isActive = conv.id === client.activeId;
-				if (isActive && client !== this) throw new Error("该对话正在其他窗口中使用，请先切换到其他对话");
+				if (!isActive || client !== this) throw new Error("该对话仍在后台或其他窗口中打开，请先切换离开后再迁移");
 				if (client.restartingSession || conv.session.isStreaming || conv.queueSteering.length || conv.queueFollowUp.length || conv.tree?.busy || conv.terminals.list().length) {
 					throw new Error("该对话仍在运行或持有终端，请结束任务并关闭终端后再迁移");
 				}
-				if (isActive) activeOwner = conv;
+				activeOwner = conv;
 			}
 			if (activeOwner) {
 				if (activeOwner.wiki) throw new Error("请在普通对话列表中迁移");
