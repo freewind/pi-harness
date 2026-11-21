@@ -25,6 +25,7 @@ import type { TreeRequest } from "./protocol.js";
 import { createHash, randomUUID } from "node:crypto";
 import { recoveryEvent, isRecovering, recoverySnapshot } from "./recovery-state.js";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { openToolOutput, toolOutputManifest, toolOutputId } from "./tool-output.js";
 import { nativeToolDetails, toolExitCode } from "./serialize.js";
 import { flushPromptReload, getSystemPromptState, promptReloadStatus, promptUsesFile, queuePromptReload, writeSystemPromptFile } from "./system-prompt-files.js";
@@ -75,9 +76,19 @@ export { QuiesceRejectedError };
  * so reconnects just re-request a snapshot.
  */
 import {
+	closeSync,
+	createReadStream,
+	createWriteStream,
 	existsSync,
+	lstatSync,
+	mkdirSync,
+	linkSync,
+	openSync,
+	readSync,
 	rmSync,
+	renameSync,
 	statSync,
+	unlinkSync,
 	writeFileSync,
 	watch,
 } from "node:fs";
@@ -224,6 +235,7 @@ type SummarizationAuth = {
 export class ClientSession {
 	readonly clientId: string;
 	private static liveClients = new Map<string, ClientSession>();
+	private static movingSessionPaths = new Set<string>();
 
 	/** Set by AgentService.attach: reflects the SERVICE-wide quiesce flag
 	 *  (server draining — new work rejected). Default false for direct use. */
@@ -2463,6 +2475,7 @@ export class ClientSession {
 		this.invalidateLists();
 		try {
 			const abs = resolve(path);
+			if (ClientSession.movingSessionPaths.has(abs)) throw new Error("该对话正在迁移，请稍后重试");
 			// Guardrail: only transcripts under the shared sessions root
 			// (<agentDir>/sessions/) may be deleted — never arbitrary files.
 			const sessionsRoot = resolve(this.agentDir, "sessions");
@@ -2540,6 +2553,7 @@ export class ClientSession {
 		this.invalidateLists();
 		try {
 			const abs = resolve(path);
+			if (ClientSession.movingSessionPaths.has(abs)) throw new Error("该对话正在迁移，请稍后重试");
 			// Same guardrail as deleteSession: only transcripts under the
 			// shared sessions root may be written, never arbitrary files.
 			const sessionsRoot = resolve(this.agentDir, "sessions");
@@ -2575,6 +2589,163 @@ export class ClientSession {
 		}
 	}
 
+	/** Move a persisted transcript to another project's session directory without forking it. */
+	async moveSession(path: string, targetCwd: string): Promise<void> {
+		if (this.switchingWorkspace) { this.emitNotice("warning", "当前对话正在切换，请稍后重试。"); return; }
+		const source = resolve(path);
+		if (ClientSession.movingSessionPaths.has(source)) { this.emitNotice("warning", "该对话正在迁移，请稍后重试。"); return; }
+		ClientSession.movingSessionPaths.add(source);
+		this.invalidateLists();
+		let backup: string | undefined;
+		let destination: string | undefined;
+		let temporary: string | undefined;
+		let destinationCreated = false;
+		let openedRuntime: AgentSessionRuntime | undefined;
+		let openedTerminals: TerminalManager | undefined;
+		let candidate: Conversation | undefined;
+		let activeOwner: Conversation | undefined;
+		let committed = false;
+		try {
+			const sessionsRoot = resolve(this.agentDir, "sessions");
+			if (!source.startsWith(sessionsRoot + sep)) throw new Error("只能迁移会话目录中的对话记录");
+			const sourceStat = lstatSync(source);
+			if (!sourceStat.isFile() || sourceStat.size === 0) throw new Error("会话文件已失效，请刷新历史列表");
+			const sourceCwd = resolve(this.cwd);
+			const target = resolve(targetCwd);
+			if (!isSessionDirectory(target)) throw new Error("目标项目目录不存在");
+			if (sourceCwd === target) throw new Error("目标项目与当前项目相同");
+			let headerLine = Buffer.alloc(0);
+			let newline = -1;
+			const sourceFd = openSync(source, "r");
+			try {
+				const chunk = Buffer.alloc(4096);
+				let position = 0;
+				while (position < 1024 * 1024) {
+					const bytesRead = readSync(sourceFd, chunk, 0, chunk.length, position);
+					if (!bytesRead) break;
+					const part = chunk.subarray(0, bytesRead);
+					const index = part.indexOf(0x0a);
+					if (index >= 0) {
+						headerLine = Buffer.concat([headerLine, part.subarray(0, index)]);
+						newline = position + index;
+						break;
+					}
+					headerLine = Buffer.concat([headerLine, part]);
+					position += bytesRead;
+				}
+			} finally { closeSync(sourceFd); }
+			if (newline < 0) throw new Error("会话文件格式无效");
+			const header = JSON.parse(headerLine.toString("utf8")) as { type?: unknown; cwd?: unknown; [key: string]: unknown };
+			if (header.type !== "session" || typeof header.cwd !== "string" || resolve(header.cwd) !== sourceCwd) throw new Error("会话不属于当前项目");
+
+			const owners = [...ClientSession.liveClients.values()].flatMap(client => [...client.convs.values()]
+				.filter(conv => conv.session.sessionFile && resolve(conv.session.sessionFile) === source)
+				.map(conv => ({ client, conv })));
+			for (const { client, conv } of owners) {
+				if (client.cwdSwitchRunning) throw new Error("该对话正在其他窗口中切换工作区，请稍后重试");
+				const isActive = conv.id === client.activeId;
+				if (isActive && client !== this) throw new Error("该对话正在其他窗口中使用，请先切换到其他对话");
+				if (client.restartingSession || conv.session.isStreaming || conv.queueSteering.length || conv.queueFollowUp.length || conv.tree?.busy || conv.terminals.list().length) {
+					throw new Error("该对话仍在运行或持有终端，请结束任务并关闭终端后再迁移");
+				}
+				if (isActive) activeOwner = conv;
+			}
+			if (activeOwner) {
+				if (activeOwner.wiki) throw new Error("请在普通对话列表中迁移");
+				if ([...this.convs.values()].filter(conv => conv.cwd === target).length >= MAX_OPEN_CONVERSATIONS) {
+					throw new Error(`目标项目运行的对话已达上限（${MAX_OPEN_CONVERSATIONS} 个）`);
+				}
+			}
+			this.openingHistory = true;
+
+			const targetDir = join(sessionsRoot, `--${target.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
+			mkdirSync(targetDir, { recursive: true });
+			destination = join(targetDir, basename(source));
+			if (existsSync(destination)) throw new Error("目标项目中已存在相同会话文件");
+			temporary = join(targetDir, `.move-${randomUUID()}.tmp`);
+			backup = `${source}.${randomUUID()}.moving`;
+			const updatedHeader = Buffer.from(`${JSON.stringify({ ...header, cwd: target })}\n`, "utf8");
+			writeFileSync(temporary, updatedHeader, { flag: "wx", mode: sourceStat.mode });
+			await pipeline(createReadStream(source, { start: newline + 1 }), createWriteStream(temporary, { flags: "a" }));
+			const sourceAfterCopy = statSync(source);
+			if (sourceAfterCopy.dev !== sourceStat.dev || sourceAfterCopy.ino !== sourceStat.ino || sourceAfterCopy.size !== sourceStat.size || sourceAfterCopy.mtimeMs !== sourceStat.mtimeMs || sourceAfterCopy.ctimeMs !== sourceStat.ctimeMs) {
+				throw new Error("迁移期间会话文件发生变化，请重试");
+			}
+			renameSync(source, backup);
+			try {
+				linkSync(temporary, destination);
+				destinationCreated = true;
+				unlinkSync(temporary);
+				temporary = undefined;
+			} catch (error) {
+				renameSync(backup, source); backup = undefined;
+				throw error;
+			}
+
+			if (activeOwner) {
+				const id = this.nextConversationId();
+				openedTerminals = this.makeTerminalManager(id, target);
+				const manager = SessionManager.open(destination, targetDir, target);
+				openedRuntime = await createAgentSessionRuntime(this.makeRuntimeFactory(), { cwd: target, agentDir: this.agentDir, sessionManager: manager });
+				candidate = this.makeConversation(openedRuntime, id, openedTerminals);
+				candidate.promptedSinceActive = true;
+				candidate.createdAt = activeOwner.createdAt;
+				this.convs.set(candidate.id, candidate);
+				await this.bindSession(candidate);
+			}
+
+			this.thinkingDurationStore.moveSession(source, destination);
+			unlinkSync(backup);
+			backup = undefined;
+			committed = true;
+			if (activeOwner && candidate) {
+				const displaced = this.displaceActive();
+				this.activeId = candidate.id;
+				this.cwd = target;
+				this.files.unwatchGit();
+				this.files.unwatchDir();
+				try { this.stateStore.remember(this.clientId, target); } catch { /* Transcript ownership is already committed. */ }
+				try { this.onCwdChanged?.(target); } catch { /* Plugin workspace sync is best-effort. */ }
+				if (displaced && displaced !== activeOwner) await this.removeConversation(displaced.id);
+			}
+			if (activeOwner && candidate) {
+				await this.removeConversation(activeOwner.id);
+				this.cwdSwitchRunning = false;
+				this.webUi.refresh();
+				this.flushSnapshot(true);
+				this.pushTerminals();
+				void this.pushSlashCommands();
+				void this.refreshSessions();
+				void this.listCommands();
+			}
+			for (const { client } of owners) {
+				client.invalidateLists();
+				client.emitConversations();
+				void client.pushSessions();
+				void client.pushProjects();
+			}
+			this.emit({ type: "notice", level: "info", text: `对话已移到 ${target}` });
+		} catch (error) {
+			if (!committed && candidate) {
+				this.convs.delete(candidate.id);
+				candidate.unsubscribe?.(); candidate.tree?.dispose(); candidate.webUi.dispose();
+			}
+			openedTerminals?.killAll();
+			if (openedRuntime && !committed) await openedRuntime.dispose().catch(() => {});
+			if (temporary && existsSync(temporary)) unlinkSync(temporary);
+			if (!committed && destinationCreated && destination && existsSync(destination)) unlinkSync(destination);
+			if (backup && existsSync(backup) && !existsSync(source)) renameSync(backup, source);
+			if (committed) this.emit({ type: "notice", level: "error", text: `对话已迁移，但工作区切换未完成：${(error as Error).message}` });
+			if (!committed) this.emit({ type: "notice", level: "error", text: `迁移对话失败：${(error as Error).message}` });
+		} finally {
+			this.openingHistory = false;
+			ClientSession.movingSessionPaths.delete(source);
+			this.invalidateLists();
+			void this.pushSessions();
+			void this.pushProjects();
+		}
+	}
+
 	/** Open a persisted session as the active conversation (from listSessions).
 	 *
 	 * A persisted-session click must follow the same ownership rule as
@@ -2584,6 +2755,7 @@ export class ClientSession {
 	 * user opened history while it was streaming.
 	 */
 	async switchSession(path: string): Promise<boolean> {
+		if (ClientSession.movingSessionPaths.has(resolve(path))) { this.emitNotice("warning", "该对话正在迁移，请稍后重试。"); return false; }
 		if (this.wikiClient || this.activeIsWiki) { this.emitNotice("warning", "请在知识库中恢复文档会话。"); return false; }
 		if (this.openingHistory || this.restartingSession) { this.emitNotice("warning", "当前会话正在切换，请稍后重试。"); return false; }
 		if (this.conv.tree?.busy) { this.emitNotice("warning", "等待当前切换完成。"); return false; }

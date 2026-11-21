@@ -72,6 +72,7 @@ interface LeftPanelProps {
 			| { type: "remove_project"; path: string }
 			| { type: "delete_session"; path: string }
 			| { type: "rename_session"; path: string; name: string }
+			| { type: "move_session"; path: string; cwd: string }
 			| { type: "browse_dirs"; path?: string },
 	) => boolean;
 	/** True while the panel is actually on screen (desktop: always; mobile:
@@ -173,6 +174,7 @@ export const LeftPanel = memo(function LeftPanel({
 	const [renaming, setRenaming] = useState<string | null>(null);
 	const [renameDraft, setRenameDraft] = useState("");
 	const [openMenu, setOpenMenu] = useState<string | null>(null);
+	const [movingSession, setMovingSession] = useState<string | null>(null);
 	const [collapsedActive, setCollapsedActive] = useState(false);
 	useEffect(() => setCollapsedActive(false), [cwd]);
 	useEffect(() => {
@@ -390,6 +392,7 @@ export const LeftPanel = memo(function LeftPanel({
 									<button type="button" className="lp-menu-trigger" aria-label={`${displayName(s)} · ${t("more")}`} aria-haspopup="menu" aria-expanded={openMenu === `sess:${s.path}`} onClick={() => setOpenMenu((key) => key === `sess:${s.path}` ? null : `sess:${s.path}`)}><FiMoreHorizontal /></button>
 									{openMenu === `sess:${s.path}` && <div className="lp-menu-popover" role="menu">
 										<button type="button" role="menuitem" onClick={() => { setRenameDraft(s.name ?? displayName(s)); setRenaming(s.path); setOpenMenu(null); }}>{t("renameSession")}</button>
+										{(s.source === "web" || !!conv) && <button type="button" role="menuitem" disabled={!ready || !!conv?.isStreaming} onClick={() => { setMovingSession(s.path); setOpenMenu(null); }}>{t("moveConversation")}</button>}
 										<button type="button" role="menuitem" className={confirmDel === `sess:${s.path}` ? "danger" : ""} onClick={() => {
 											if (confirmDel === `sess:${s.path}`) { send({ type: "delete_session", path: s.path }); setConfirmDel(null); setOpenMenu(null); }
 											else setConfirmDel(`sess:${s.path}`);
@@ -524,6 +527,17 @@ export const LeftPanel = memo(function LeftPanel({
 				<div className="workspace-name-actions"><button type="button" onClick={() => setWorkspaceForm(null)}>{t("cancel")}</button><button disabled={workspaceBusy || !workspaceName.trim()}>{t(workspaceForm === "create" ? "workspaceCreate" : "workspaceRename")}</button></div>
 			</form></div>}
 
+			{movingSession && (
+				<FolderPickerModal
+					dirBrowse={dirBrowse}
+					initialPath={cwd}
+					busy={!ready}
+					pickLabel={t("moveConversation")}
+					onBrowse={(path) => send({ type: "browse_dirs", path })}
+					onPick={(path) => { if (send({ type: "move_session", path: movingSession, cwd: path })) setMovingSession(null); }}
+					onClose={() => setMovingSession(null)}
+				/>
+			)}
 			{picking && selectedGroup && (
 				<FolderPickerModal
 					dirBrowse={dirBrowse}

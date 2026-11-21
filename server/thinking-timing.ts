@@ -50,6 +50,19 @@ export class ThinkingDurationStore {
 		} catch { this.values = {}; }
 	}
 	private key(sessionFile: string, timestamp: number): string { return `${sessionFile}\u0000${timestamp}`; }
+	moveSession(oldPath: string, newPath: string): void {
+		for (const [key, value] of Object.entries(this.values)) {
+			if (!key.startsWith(`${oldPath}\u0000`)) continue;
+			this.values[`${newPath}${key.slice(oldPath.length)}`] = value;
+			delete this.values[key];
+		}
+		try {
+			mkdirSync(dirname(this.filePath), { recursive: true });
+			const tmp = `${this.filePath}.${process.pid}.tmp`;
+			writeFileSync(tmp, JSON.stringify(this.values));
+			renameSync(tmp, this.filePath);
+		} catch { /* Duration metadata must never interrupt a reply. */ }
+	}
 	save(sessionFile: string | null | undefined, timestamp: number, durations: Record<string, number>): void {
 		if (!sessionFile || !Number.isFinite(timestamp) || timestamp <= 0 || Object.keys(durations).length === 0) return;
 		const key = this.key(sessionFile, timestamp);

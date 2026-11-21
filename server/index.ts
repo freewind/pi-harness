@@ -757,6 +757,9 @@ wss.on("connection", (ws) => {
 			case "rename_session":
 				void cs.renameSession(msg.path, msg.name);
 				break;
+			case "move_session":
+				void cs.moveSession(msg.path, msg.cwd);
+				break;
 			case "browse_dirs":
 				void cs.browseDirs(msg.path);
 				break;

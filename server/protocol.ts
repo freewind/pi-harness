@@ -677,6 +677,8 @@ export type ClientMessage =
 	 *  `session_info` entry inside the transcript; an empty name clears it and
 	 *  the list falls back to the first user message. */
 	| { type: "rename_session"; path: string; name: string }
+	/** Move a complete persisted conversation transcript to another project directory. */
+	| { type: "move_session"; path: string; cwd: string }
 	/** List the SUBDIRECTORIES of `path` for the workspace picker. Distinct
 	 *  from `list_files`, which is deliberately confined to the current
 	 *  workspace — picking a *new* workspace has to look outside it. Omit
