@@ -49,6 +49,7 @@ Windows 计划任务部署。
 | 样式 | 单文件 `web/src/styles.css`（浅色/深色/跟随系统，CSS 变量） |
 
 SDK 与 pi-ai 精确锁定 1.5.2，不应用本项目的 SDK 补丁。升级契约与版本差异见 `docs/pi-1.5-upgrade.md`。Codemode 与工具搜索使用原生 defaultTools 默认开启，已有原生配置优先。
+模型配置表单：`server/model-config-document.ts` 使用锁定 SDK schema、脱敏快照和 JSONC 字段补丁；界面为 `ModelConfigEditor.tsx`，原始值与运行时额度分开。原生编辑用协议 59 的版本化保存回执，外部来源保持独立副本语义；修改时读 `docs/architecture-model-sources.md` 和 `docs/ui-design.md`。
 系统提示词：修改分段来源、原生文件编辑或重载时，读取 `docs/architecture-system-prompt.md`。
 Extensions：修改内置扩展清单/状态、包安装、启停、更新、作用域迁移、目录浏览或单文件编辑时，读取 `docs/architecture-extensions.md`。
 Codemode 卡片与 MCP/Codemode 设置遵循 15a/15b 设计；状态、项目覆盖、费用及输出限制读取 `docs/architecture-plugins.md`。

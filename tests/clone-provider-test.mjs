@@ -188,18 +188,12 @@ try {
 	);
 
 	// 3) save the draft under deepseek-2, then clone again → deepseek-3.
-	c.send({
-		type: "save_model_config",
-		providerId: "deepseek-2",
-		config: {
-			providerId: "deepseek-2",
-			name: "DeepSeek 第二把钥匙",
-			api: "openai-completions",
-			baseUrl: "https://api.deepseek.com",
-			apiKey: "second-key",
-			models: r1.config.models,
-		},
-	});
+	c.send({ type: "get_model_config_editor", providerId: "", reqId: 101 });
+	const edit = await c.waitFor("model_config_editor_result", 10000, m => m.reqId === 101);
+	c.send({ type: "save_model_config_patch", providerId: "deepseek-2", version: edit.snapshot.version, reqId: 102, changes: [
+		{ target: { kind: "provider" }, operations: Object.entries({ name: "DeepSeek 第二把钥匙", api: "openai-completions", baseUrl: "https://api.deepseek.com", apiKey: "second-key" }).map(([key, value]) => ({ op: "set", path: [key], value })) },
+		...r1.config.models.map(({ id, ...values }) => ({ target: { kind: "model", id }, operations: Object.entries(values).map(([key, value]) => ({ op: "set", path: [key], value })) })),
+	] });
 	await c.waitFor("models_config", 10000, (m) =>
 		m.providers.some((p) => p.providerId === "deepseek-2"),
 	);

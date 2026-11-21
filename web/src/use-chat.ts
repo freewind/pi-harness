@@ -1163,6 +1163,9 @@ export function useChat() {
 				case "models_config":
 					dispatch({ type: "models_config", providers: msg.providers, sources: msg.sources });
 					break;
+				case "model_config_editor_result":
+					window.dispatchEvent(new CustomEvent("pi-model-config-event", { detail: msg }));
+					break;
 				case "native_mcp_result":
 					window.dispatchEvent(new CustomEvent("pi-native-mcp-event", { detail: msg }));
 					break;
@@ -1323,6 +1326,7 @@ export function useChat() {
 		};
 
 		ws.onclose = () => {
+			window.dispatchEvent(new CustomEvent("pi-model-config-disconnected"));
 			playgroundChatConnection(false);
 			if (wsRef.current === ws) wsRef.current = null;
 			// Terminals died with the server-side PTYs — drop writers/buffers.

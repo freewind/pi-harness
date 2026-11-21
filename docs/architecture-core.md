@@ -12,7 +12,7 @@ Workspace 跨仓库与知识库分析通过内置 `subagent` 原生工具启动�
 
 Pi 1.0 工具结果的 `nestedCalls` 投影为独立子调用记录（参数、状态、耗时与错误），不会伪造成顶层助手调用。工具返回的 image 块作为图片保留；工具执行增量和结束事件传递 `parentToolCallId`。虚拟模型快照保留用户选择的 `model` 并附带 SDK `session.routedModel`，模型控件显示实际路由。
 
-模型编辑器只修改聊天模型和表单拥有的字段；保存时保留 image/classifier 条目、operations、headers、采样及其他未知字段。不同 operation 可以使用相同模型 ID。已保存的密钥不回传表单，留空表示保留服务器上的密钥。`model-config-preservation-test.mjs` 覆盖实际读写路径。
+原生模型编辑器通过 `model-config-document.ts` 读取实际 agentDir/models.json，使用锁定 SDK 的 ModelsJsonSchemas 生成脱敏编辑快照与校验，`save_model_config_patch` 按 target + set/remove 路径局部更新 JSONC。随机版本对应的原文仅在服务端保留，保存前拒绝过期版本，原子写入保留权限。显式 false/0/null 与删除覆盖分开；未知字段、非聊天条目和未改内容保留，typed operation 共享 ID 不互相覆盖。已保存密钥/header 值不回传；模型表单展示原值，运行时 maxTokens 覆盖单独显示。内置模型使用 modelOverrides。外部来源仍由原有窄字段接口保存本地独立副本，不反写第三方文件。`model-config-preservation-test.mjs` 与 `unit/model-config-merge.test.ts` 覆盖实际字段补丁和保留语义。
 
 账号登录由 `server/provider-auth.ts` 桥接公开 `ModelRuntime.login/logout`。浏览器仅收到授权 URL、设备码或请求提示，凭据由 SDK 保存；响应同时匹配 requestId/promptId，取消和 dispose 中断待处理请求。OpenAI ChatGPT 登录的稳定设备 ID 来自 SDK SettingsManager。模拟 OAuth 回归不证明真实账号授权成功；浏览器回归验证授权码提交、取消及中英文展示。
 
@@ -74,7 +74,7 @@ SDK `tool_execution_update.partialResult` 是累计输出快照，服务端发�
 - **WS 升级做 Origin/Host 同权威校验**（`server/index.ts` 的 `originAllowed`，`WebSocketServer({ noServer: true })` + 手动 `handleUpgrade`）：Origin 存在时其 hostname+**有效端口**必须与请求 Host 一致（浏览器里 `example-host:8445` 与 `example-host:9443` 是不同源）；非浏览器客户端（无 Origin）放行；`PI_WEB_ALLOW_ORIGINS` 白名单绕过（dev:server 已内置 `http://localhost:5173,http://127.0.0.1:5173`，反代场景自配）；`PI_WEB_ALLOW_HOSTS` 可选严格 hostname 白名单。**不要**加回「本地任意端口放行」——那正是提案要修的洞。
 - **quiesce 准入控制**（`AgentService.quiesce/unquiesce`）：进入排空后**拒绝一切新工作**——新 prompt（native slash 命令例外，纯配置无 token）、new_chat、edit_message 分支/派生、switch_session；存量运行继续跑完。已知 clientId 仍可 attach 看存量（发 notice 提示），**全新客户端 attach 抛 `QuiesceRejectedError` → index.ts 以 4403 关 WS**，浏览器重连循环在 unquiesce 后自动恢复。
 - **控制 socket**（`server/control-socket.ts`）：CLI 的 `server status|quiesce|unquiesce` 经本地 mode-0600 unix socket / Windows 命名管道（`\\.\pipe\pi-harness-<port>`）与运行中进程通信，`status` 报告真实 socket 数（`noteSocketOpen/Close`，index.ts 维护）、active/pending 计数、quiesce 状态；无鉴权 HTTP 端点。
-- **provider headers 不下发浏览器**（`models_config` 不再携带 `headers` 字段，可能含 Authorization/API key）：`saveModelConfig` 保存时若 config 无 headers 则保留旧值（`prevHeaders`）。`UiProviderConfig.headers` 已从 protocol.ts / types.ts 删除，前端没有任何地方编辑 headers（仅 apiKey 经独立消息 `set_provider_api_key` 走浏览器）。
+- **已有 provider/model headers 的值不下发浏览器**：模型编辑快照仅包含名称、空值与服务端 secretPaths，未改内容由原文保留；替换/删除通过明确字段操作提交。models_config 摘要继续不带 headers。原生 OAuth token 仍只由 SDK 管理；不为表单显示执行命令认证。
 - **dev 兼容**：vite :5173 代理 /ws 到 :8788 时 Origin(:5173) ≠ Host(:8788)，靠 `PI_WEB_ALLOW_ORIGINS`（dev:server 内置）放行，勿删。
 
 ## 主题

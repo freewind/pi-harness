@@ -1,7 +1,9 @@
 import type { ModelSourceSync } from "./model-source-sync.js";
+import { ModelConfigDocument, ModelConfigDocumentError, configRecord, modelConfigSchemas, modelCompatSchemas, parseModelConfig, projectModelConfig } from "./model-config-document.js";
+import type { ModelConfigChange, ModelConfigEditorSnapshot, ModelConfigValue } from "./protocol.js";
 import { isSelectableProvider } from "./provider-catalog.js";
 import { updateAuthFile } from "./auth-file.js";
-import { isChatModelConfig, mergeChatProvider, readModelCompat } from "./model-config-merge.js";
+import { isChatModelConfig, readModelCompat } from "./model-config-merge.js";
 /**
  * model-admin — 模型/服务商配置管理，从 agent-service.ts 抽出。
  *
@@ -15,9 +17,7 @@ import { isChatModelConfig, mergeChatProvider, readModelCompat } from "./model-c
  * 经 ModelAdminHost 与 ClientSession 解耦（同 settings/goal/slash 服务模式）。
  * UI 文案直接中文（服务端 notice 约定）。apiKey/headers 绝不下发浏览器。
  */
-import { existsSync, readFileSync } from "node:fs";
-import { writeFileAtomic } from "./private-file.js";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type { ServerMessage, UiModelConfigEntry, UiProviderConfig } from "./protocol.js";
 
@@ -36,46 +36,6 @@ export interface ModelAdminHost {
 	pushModels: () => Promise<void>;
 }
 
-/** Strip // and /* *\/ comments without touching string literals (URLs contain //). */
-function stripJsonComments(src: string): string {
-	let out = "";
-	let inString = false;
-	let i = 0;
-	while (i < src.length) {
-		const c = src[i];
-		const next = src[i + 1];
-		if (inString) {
-			out += c;
-			if (c === "\\") {
-				out += next ?? "";
-				i += 2;
-				continue;
-			}
-			if (c === '"') inString = false;
-			i++;
-			continue;
-		}
-		if (c === '"') {
-			inString = true;
-			out += c;
-			i++;
-			continue;
-		}
-		if (c === "/" && next === "/") {
-			while (i < src.length && src[i] !== "\n") i++;
-			continue;
-		}
-		if (c === "/" && next === "*") {
-			i += 2;
-			while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
-			i += 2;
-			continue;
-		}
-		out += c;
-		i++;
-	}
-	return out;
-}
 
 /** Numeric metadata value (NaN/string "unknown" → undefined). */
 function numMeta(v: unknown): number | undefined {
@@ -158,7 +118,76 @@ function parseGoogleModel(m: unknown): UiModelConfigEntry {
 
 
 export class ModelAdminService {
-	constructor(private readonly host: ModelAdminHost) {}
+	private readonly document: ModelConfigDocument;
+	private pendingEditors = new Map<string, { reqId: number; version: string }>();
+	constructor(private readonly host: ModelAdminHost) { this.document = new ModelConfigDocument(join(host.agentDir, "models.json")); }
+
+	private editorSnapshot(providerId: string): ModelConfigEditorSnapshot {
+		if (providerId !== "" && !/^[\w.-]+$/.test(providerId) || this.host.sources?.()?.owns(providerId)) throw new ModelConfigDocumentError("invalid");
+		const { document, version } = this.document.open(providerId);
+		const original = configRecord(configRecord(document.providers)[providerId]);
+		const secretPaths: (string | number)[][] = [];
+		const provider = configRecord(projectModelConfig(original, modelConfigSchemas.provider, secretPaths));
+		const models: ModelConfigEditorSnapshot["models"] = [];
+		const explicit = new Set<string>();
+		for (const value of Array.isArray(original.models) ? original.models : []) {
+			const model = configRecord(value);
+			if (!isChatModelConfig(model) || typeof model.id !== "string") continue;
+			const secrets: (string | number)[][] = [];
+			models.push({ target: { kind: "model", id: model.id }, value: configRecord(projectModelConfig(model, modelConfigSchemas.model, secrets)), secretPaths: secrets });
+			explicit.add(model.id);
+		}
+		const overrides = configRecord(original.modelOverrides);
+		const runtime = this.host.modelRuntime();
+		const catalog = new Map((providerId ? runtime.getModels(providerId) : []).map(model => [model.id, model]));
+		for (const id of new Set([...Object.keys(overrides), ...catalog.keys()])) {
+			if (explicit.has(id) && !Object.hasOwn(overrides, id)) continue;
+			const secrets: (string | number)[][] = [];
+			models.push({ target: { kind: "override", id }, value: configRecord(projectModelConfig(overrides[id] ?? {}, modelConfigSchemas.override, secrets)), secretPaths: secrets });
+		}
+		for (const row of models) {
+			const effective = catalog.get(row.target.id!);
+			if (effective) row.effective = { name: effective.name, api: effective.api, contextWindow: effective.contextWindow, maxTokens: effective.maxTokens };
+		}
+		return { providerId, version, path: this.document.path, provider, secretPaths, models, schemas: modelConfigSchemas, compatSchemas: modelCompatSchemas,
+			outputOverride: process.env.PI_MAX_TOKENS ?? (process.env.PI_MAX_TOKENS_FLOOR !== undefined ? `PI_MAX_TOKENS_FLOOR=${process.env.PI_MAX_TOKENS_FLOOR}` : "128000") };
+	}
+
+	async getModelConfigEditor(providerId: string, reqId: number): Promise<void> {
+		try { this.host.emit({ type: "model_config_editor_result", providerId, reqId, status: "loaded", snapshot: this.editorSnapshot(providerId) }); }
+		catch (error) { this.host.emit({ type: "model_config_editor_result", providerId, reqId, status: error instanceof ModelConfigDocumentError ? error.code : "invalid" }); }
+	}
+
+	async saveModelConfigPatch(providerId: string, reqId: number, version: string, changes: ModelConfigChange[]): Promise<void> {
+		try {
+			this.document.save(providerId, version, changes);
+		} catch (error) {
+			this.host.emit({ type: "model_config_editor_result", providerId, reqId, status: error instanceof ModelConfigDocumentError ? error.code : "invalid", field: error instanceof ModelConfigDocumentError ? error.field : undefined });
+			return;
+		}
+		let status: "applied" | "pending" | "application_failed" = "applied";
+		try {
+			const sources = this.host.sources?.();
+			if (sources) { await sources.sync(); status = sources.applicationState(this.host.modelRuntime()); }
+			else { await this.host.modelRuntime().refresh({ allowNetwork: false }); if (this.host.modelRuntime().getError()) status = "application_failed"; }
+			this.host.invalidatePiConfig();
+			await this.listModelsConfig();
+			await this.host.pushModels();
+		} catch { status = "application_failed"; }
+		try { this.host.emit({ type: "model_config_editor_result", providerId, reqId, status, snapshot: this.editorSnapshot(providerId) }); }
+		catch { this.host.emit({ type: "model_config_editor_result", providerId, reqId, status: "application_failed" }); }
+		if (status === "pending") this.pendingEditors.set(providerId, { reqId, version: this.document.read() });
+		this.host.flushSnapshot();
+	}
+
+	modelConfigApplied(): void {
+		const state = this.host.sources?.()?.applicationState(this.host.modelRuntime());
+		if (!state || state === "pending") return;
+		for (const [providerId, pending] of this.pendingEditors) {
+			if (pending.version === this.document.read()) this.host.emit({ type: "model_config_editor_result", providerId, reqId: pending.reqId, status: state });
+			this.pendingEditors.delete(providerId);
+		}
+	}
 
 	/** Persist an api-key credential for a provider (auth.json) and apply it now. */
 	async setProviderApiKey(provider: string, apiKey: string): Promise<void> {
@@ -384,50 +413,6 @@ export class ModelAdminService {
 	// Custom model config (agentDir/models.json)
 	// ---------------------------------------------------------------------------
 
-	private modelsConfigPath(): string {
-		return join(this.host.agentDir, "models.json");
-	}
-
-	/** Strip // and /* *\/ comments without touching string literals (URLs contain //). */
-	private static stripJsonComments(src: string): string {
-		let out = "";
-		let inString = false;
-		let i = 0;
-		while (i < src.length) {
-			const c = src[i];
-			const next = src[i + 1];
-			if (inString) {
-				out += c;
-				if (c === "\\") {
-					out += next ?? "";
-					i += 2;
-					continue;
-				}
-				if (c === '"') inString = false;
-				i++;
-				continue;
-			}
-			if (c === '"') {
-				inString = true;
-				out += c;
-				i++;
-				continue;
-			}
-			if (c === "/" && next === "/") {
-				while (i < src.length && src[i] !== "\n") i++;
-				continue;
-			}
-			if (c === "/" && next === "*") {
-				i += 2;
-				while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
-				i += 2;
-				continue;
-			}
-			out += c;
-			i++;
-		}
-		return out;
-	}
 
 	/** Read + parse models.json (tolerating // and /* *\/ comments like the SDK). */
 	/** Top-level keys other than providers (`$schema`, SDK 1.2+) are kept so writes round-trip them. */
@@ -435,22 +420,16 @@ export class ModelAdminService {
 		providers: Record<string, Record<string, unknown>>;
 		rest: Record<string, unknown>;
 	} {
-		const path = this.modelsConfigPath();
-		try {
-			const raw = readFileSync(path, "utf8");
-			const parsed = JSON.parse(stripJsonComments(raw)) as {
-				providers?: Record<string, Record<string, unknown>>;
-			} & Record<string, unknown>;
-			const { providers, ...rest } = parsed ?? {};
-			return { providers: providers ?? {}, rest };
-		} catch {
-			return { providers: {}, rest: {} };
-		}
+		const parsed = parseModelConfig(this.document.read());
+		const { providers, ...rest } = parsed;
+		return { providers: providers as Record<string, Record<string, unknown>>, rest };
 	}
 
 	/** Send the current models.json custom providers to the client. */
 	async listModelsConfig(): Promise<void> {
-		const { providers } = this.readModelsConfig();
+		let providers: Record<string, Record<string, unknown>>;
+		try { ({ providers } = this.readModelsConfig()); }
+		catch { this.host.emit({ type: "models_config", providers: this.host.sources?.()?.configs() ?? [], sources: this.host.sources?.()?.status(this.host.modelRuntime()) }); this.host.emit({ type: "notice", level: "error", text: "模型配置损坏或不可读，未修改文件" }); return; }
 		const list: UiProviderConfig[] = Object.entries(providers).filter(([id]) => isSelectableProvider(id)).map(
 			([providerId, p]) => {
 				const models = Array.isArray(p.models)
@@ -461,7 +440,7 @@ export class ModelAdminService {
 							reasoning: m.reasoning as boolean | undefined,
 							input: Array.isArray(m.input) ? (m.input as string[]) : undefined,
 							contextWindow: m.contextWindow as number | undefined,
-							maxTokens: this.host.modelRuntime().getModel(providerId, String(m.id ?? ""))?.maxTokens ?? m.maxTokens as number | undefined,
+							maxTokens: m.maxTokens as number | undefined,
 						}))
 					: [];
 				return {
@@ -470,7 +449,7 @@ export class ModelAdminService {
 					name: p.name as string | undefined,
 					compat: readModelCompat(p.compat),
 					api: p.api as string | undefined,
-					baseUrl: p.baseUrl as string | undefined,
+					baseUrl: typeof p.baseUrl === "string" ? String(projectModelConfig(p.baseUrl, { type: "string" }, [], ["baseUrl"])) : undefined,
 					nonChatModelCount: Array.isArray(p.models) ? p.models.filter(model => !isChatModelConfig(model)).length : 0,
 					authHeader: p.authHeader as boolean | undefined,
 					// headers are intentionally NOT sent to the browser — they may
@@ -571,19 +550,22 @@ export class ModelAdminService {
 		apiKey?: string,
 		authHeader?: boolean,
 		api?: string,
+		providerId?: string,
 	): Promise<void> {
 		const emitError = (error: string) =>
 			this.host.emit({ type: "fetch_models_result", reqId, ok: false, error });
 		try {
+			const saved = providerId ? configRecord(configRecord(parseModelConfig(this.document.read()).providers)[providerId]) : {};
 			const models = await ModelAdminService.probeModelsEndpoint(
-				baseUrl,
-				apiKey,
-				authHeader,
-				api,
+				baseUrl || String(saved.baseUrl ?? ""),
+				apiKey ?? (typeof saved.apiKey === "string" && !saved.apiKey.startsWith("!") && !saved.apiKey.includes("$") ? saved.apiKey : undefined),
+				authHeader ?? (typeof saved.authHeader === "boolean" ? saved.authHeader : undefined),
+				api ?? (typeof saved.api === "string" ? saved.api : undefined),
+				Object.fromEntries(Object.entries(configRecord(saved.headers)).filter((entry): entry is [string, string] => typeof entry[1] === "string" && !entry[1].startsWith("!") && !entry[1].includes("$"))),
 			);
 			this.host.emit({ type: "fetch_models_result", reqId, ok: true, models });
 		} catch (err) {
-			emitError((err as Error).message);
+			emitError("获取模型列表失败，请检查连接配置");
 		}
 	}
 
@@ -702,7 +684,8 @@ static async probeModelsEndpoint(
 			this.host.emit({ type: "refresh_provider_result", reqId, ok, ...extra });
 		try {
 			const pid = providerId.trim();
-			const { providers } = this.readModelsConfig();
+			const opened = this.document.open(pid);
+			const providers = configRecord(opened.document.providers);
 			// models.json 原始形状是 Record<string, unknown>——按已保存条目的结构断言
 			const saved = providers[pid] as
 				| {
@@ -749,15 +732,12 @@ static async probeModelsEndpoint(
 			const merged = [...prev.values()].sort((a, b) =>
 				a.id.localeCompare(b.id),
 			);
-			await this.saveModelConfig(pid, {
-				providerId: pid,
-				name: saved.name,
-				api: saved.api,
-				baseUrl: saved.baseUrl,
-				// apiKey/headers 不回传浏览器——saveModelConfig 会保留旧值
-				authHeader: saved.authHeader === true ? true : undefined,
-				models: merged,
-			});
+			const previous = new Map((saved.models ?? []).filter(model => model.type === undefined || model.type === "chat").map(model => [model.id, model]));
+			const changes: ModelConfigChange[] = fetched.map(model => ({ target: { kind: "model", id: model.id }, operations: Object.entries({ ...(previous.has(model.id) ? {} : { name: model.name ?? model.id }), ...model }).filter(([key, value]) => key !== "id" && value !== undefined && (previous.get(model.id) as Record<string, unknown> | undefined)?.[key] === undefined && Object.hasOwn(modelConfigSchemas.model.properties!, key)).map(([key, value]) => ({ op: "set", path: [key], value: value as ModelConfigValue })) }));
+			this.document.save(pid, opened.version, changes);
+			if (this.host.sources?.()) await this.host.sources()!.sync(); else await this.host.modelRuntime().refresh({ allowNetwork: false });
+			await this.listModelsConfig();
+			await this.host.pushModels();
 
 			this.host.emit({
 				type: "notice",
@@ -778,7 +758,7 @@ static async probeModelsEndpoint(
 		}
 	}
 
-	/** Upsert one provider into models.json and hot-reload the model runtime. */
+	/** External-source edits retain their existing local-copy semantics. Native edits use field patches. */
 	async saveModelConfig(
 		providerId: string,
 		config: UiProviderConfig,
@@ -789,77 +769,7 @@ static async probeModelsEndpoint(
 			catch { this.host.emit({ type: "notice", level: "error", text: "保存独立模型失败，请检查配置" }); }
 			return;
 		}
-		if (!pid || !/^[\w.-]+$/.test(pid)) {
-			this.host.emit({
-				type: "notice",
-				level: "error",
-				text: "服务商 ID 无效（仅字母/数字/._-）",
-			});
-			return;
-		}
-		const models = (config.models ?? [])
-			.filter((m) => m.id && m.id.trim())
-			.map((m) => ({
-				id: m.id.trim(),
-				compat: m.compat,
-				...(m.name?.trim() ? { name: m.name.trim() } : {}),
-				...(m.reasoning ? { reasoning: true } : {}),
-				...(m.input?.length ? { input: m.input } : {}),
-				...(m.contextWindow ? { contextWindow: Number(m.contextWindow) } : {}),
-				...(m.maxTokens ? { maxTokens: Number(m.maxTokens) } : {}),
-			}));
-		if (models.length === 0) {
-			this.host.emit({ type: "notice", level: "error", text: "至少需要一个模型" });
-			return;
-		}
-		try {
-			const { providers, rest } = this.readModelsConfig();
-			providers[pid] = mergeChatProvider(providers[pid] ?? {}, { ...config, models });
-			// models.json may carry provider apiKeys: atomic, private for new files,
-			// and an existing file keeps the mode its owner chose.
-			writeFileAtomic(this.modelsConfigPath(), JSON.stringify({ ...rest, providers }, null, 2) + "\n", { keepExistingMode: true });
-
-			// Allow a custom models.json entry to reuse the provider credential
-			// already stored in auth.json.  Seed the shared runtime too, because
-			// older pi-ai versions did not always fall back to stored credentials
-			// for a newly-created custom provider.  Never copy the secret into
-			// models.json.
-			try {
-				const auth = JSON.parse(
-					readFileSync(join(this.host.agentDir, "auth.json"), "utf8"),
-				) as Record<string, unknown>;
-				const credential = auth[pid];
-				if (
-					credential &&
-					typeof credential === "object" &&
-					"key" in credential &&
-					typeof credential.key === "string" &&
-					credential.key.trim()
-				) {
-					await this.host.modelRuntime().setRuntimeApiKey(
-						pid,
-						credential.key,
-					);
-				}
-			} catch {
-				// auth.json is optional; models.json can still use its own apiKey.
-			}
-			await this.host.modelRuntime().refresh();
-			await this.listModelsConfig();
-			await this.host.pushModels();
-			this.host.emit({
-				type: "notice",
-				level: "info",
-				text: `✅ 已保存服务商 ${pid}（${models.length} 个模型）并刷新模型列表`,
-			});
-		} catch (err) {
-			this.host.emit({
-				type: "notice",
-				level: "error",
-				text: `保存模型配置失败：${(err as Error).message}`,
-			});
-		}
-		this.host.flushSnapshot();
+		this.host.emit({ type: "notice", level: "error", text: "原生模型配置必须通过字段编辑器保存" });
 	}
 
 	/** Remove a provider from models.json and hot-reload. */
@@ -870,8 +780,7 @@ static async probeModelsEndpoint(
 			return;
 		}
 		try {
-			const { providers, rest } = this.readModelsConfig();
-			if (!(providerId in providers)) {
+			if (!this.document.deleteProvider(providerId)) {
 				this.host.emit({
 					type: "notice",
 					level: "info",
@@ -879,9 +788,8 @@ static async probeModelsEndpoint(
 				});
 				return;
 			}
-			delete providers[providerId];
-			writeFileAtomic(this.modelsConfigPath(), JSON.stringify({ ...rest, providers }, null, 2) + "\n", { keepExistingMode: true });
-			await this.host.modelRuntime().refresh();
+			if (this.host.sources?.()) await this.host.sources()!.sync();
+			else await this.host.modelRuntime().refresh({ allowNetwork: false });
 			await this.listModelsConfig();
 			await this.host.pushModels();
 			this.host.emit({
@@ -893,7 +801,7 @@ static async probeModelsEndpoint(
 			this.host.emit({
 				type: "notice",
 				level: "error",
-				text: `删除模型配置失败：${(err as Error).message}`,
+				text: "删除模型配置失败，请检查配置文件",
 			});
 		}
 		this.host.flushSnapshot();

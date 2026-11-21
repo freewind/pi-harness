@@ -16,24 +16,30 @@ try {
 	writeFileSync(path, JSON.stringify({ providers: { fixture: original } }));
 	const wire = [];
 	let refreshes = 0;
-	const service = new ModelAdminService({ agentDir: directory, emit: message => wire.push(message), flushSnapshot() {}, isDisposed: () => false, modelRuntime: () => ({ getModel: () => undefined, refresh: async () => { refreshes++; } }), invalidatePiConfig() {}, pushModels: async () => {} });
+	const service = new ModelAdminService({ agentDir: directory, emit: message => wire.push(message), flushSnapshot() {}, isDisposed: () => false, modelRuntime: () => ({ getModel: () => undefined, getModels: () => [], getError: () => undefined, refresh: async () => { refreshes++; } }), invalidatePiConfig() {}, pushModels: async () => {} });
 	await service.listModelsConfig();
 	const form = wire.at(-1).providers[0];
 	assert.deepEqual(form.models.map(model => model.id), ['chat']);
 	assert(!JSON.stringify(wire).includes('FIXTURE_SECRET'));
 	assert(!JSON.stringify(wire).includes('SECRET_COMPAT'));
 	assert.deepEqual(form.models[0].compat, { supportsMessageThreads: false, promptCacheKeyMode: 'auto' });
-	form.models[0].name = 'Renamed';
-	await service.saveModelConfig('fixture', form);
+	await service.getModelConfigEditor('fixture', 101);
+	const edit = wire.at(-1).snapshot;
+	assert(edit);
+	assert(!JSON.stringify(edit).includes('FIXTURE_SECRET'));
+	assert(!JSON.stringify(edit).includes('SECRET_COMPAT'));
+	await service.saveModelConfigPatch('fixture', 102, edit.version, [{ target: { kind: 'model', id: 'chat' }, operations: [{ op: 'set', path: ['name'], value: 'Renamed' }] }]);
 	assert.equal(refreshes, 1);
 	assert.deepEqual(JSON.parse(readFileSync(path)).providers.fixture, { ...original, models: [{ ...chat, name: 'Renamed' }, image, classifier] });
 	const before = readFileSync(path, 'utf8');
-	await service.saveModelConfig('fixture', { providerId: 'fixture', models: [{ id: 'chat' }, { id: 'chat' }] });
+	await service.saveModelConfigPatch('fixture', 103, edit.version, [{ target: { kind: 'model', id: 'chat' }, operations: [{ op: 'set', path: ['name'], value: 'stale' }] }]);
 	assert.equal(readFileSync(path, 'utf8'), before);
-	assert.equal(wire.at(-1).level, 'error');
-	form.models[0].compat = { supportsMessageThreads: null, promptCacheKeyMode: 'disabled', requiresNonNullAssistantContent: true, requiresToolsWithToolHistory: false };
-	form.compat = { supportsMessageThreads: true };
-	await service.saveModelConfig('fixture', form);
+	assert.equal(wire.at(-1).status, 'conflict');
+	await service.getModelConfigEditor('fixture', 104);
+	await service.saveModelConfigPatch('fixture', 105, wire.at(-1).snapshot.version, [
+		{ target: { kind: 'model', id: 'chat' }, operations: [{ op: 'remove', path: ['compat', 'supportsMessageThreads'] }, ...Object.entries({ promptCacheKeyMode: 'disabled', requiresNonNullAssistantContent: true, requiresToolsWithToolHistory: false }).map(([key, value]) => ({ op: 'set', path: ['compat', key], value }))] },
+		{ target: { kind: 'provider' }, operations: [{ op: 'set', path: ['compat', 'supportsMessageThreads'], value: true }] },
+	]);
 	const saved = JSON.parse(readFileSync(path)).providers.fixture;
 	assert.deepEqual(saved.compat, { ...original.compat, supportsMessageThreads: true });
 	assert.deepEqual(saved.models[0].compat, { futureField: chat.compat.futureField, promptCacheKeyMode: 'disabled', requiresNonNullAssistantContent: true, requiresToolsWithToolHistory: false });
@@ -47,5 +53,5 @@ try {
 	assert.deepEqual(refreshed.find(model => model.type === 'classifier'), classifier);
 	assert(refreshed.some(model => model.id === 'picture' && !model.type));
 	assert.equal(refreshed.find(model => model.id === 'chat').name, 'Renamed');
-	console.log('PASS production model editor preserves typed models and metadata; duplicate chat IDs do not mutate configuration');
+	console.log('PASS production model editor preserves typed models and metadata; stale edits do not mutate configuration');
 } finally { endpoint.closeAllConnections(); await new Promise(resolve => endpoint.close(resolve)); rmSync(directory, { recursive: true, force: true }); }

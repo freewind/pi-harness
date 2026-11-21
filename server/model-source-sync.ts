@@ -23,7 +23,7 @@ interface SavedState {
 	local: Record<string, Connection>;
 }
 interface Entry { aliases: string[]; provider: string; connection: Connection; slots: string[]; origin: ModelOrigin }
-interface Binding { runtime: ModelRuntime; busy: () => boolean; changed: () => void; nativeSeen: Set<string>; nativeAliases: Map<string, Provider | undefined>; fallbackModels: Set<string>; applied: number; leases: number; providers: Set<string>; tail: Promise<void> }
+interface Binding { runtime: ModelRuntime; busy: () => boolean; changed: () => void; nativeSeen: Set<string>; nativeAliases: Map<string, Provider | undefined>; fallbackModels: Set<string>; applied: number; leases: number; providers: Set<string>; tail: Promise<void>; failed?: boolean }
 const record = (value: unknown): Record<string, unknown> => value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
 const sources: ModelSourceId[] = ["pi", "claude", "codex", "opencode"];
 const slot = (c: Connection) => `${c.source}:${c.slot}`;
@@ -64,7 +64,7 @@ export function completeCapabilities(connections: Connection[]): Connection[] {
 
 /** SDK lookups may return fresh objects for an unchanged model. Avoid unnecessary auth preflight. */
 export function modelConfigurationChanged(a: NonNullable<ReturnType<ModelRuntime["getModel"]>>, b: NonNullable<ReturnType<ModelRuntime["getModel"]>>) {
-	const config = (m: typeof a) => [m.provider, m.id, m.api, m.baseUrl, m.reasoning, m.input, m.contextWindow, m.maxTokens, m.compat];
+	const config = (m: typeof a) => [m.provider, m.id, m.api, m.baseUrl, m.reasoning, m.input, m.contextWindow, m.maxTokens, m.compat, m.thinkingLevelMap, m.samplingParams, m.samplingParamsByThinkingLevel, m.cost, m.inputLimits, m.promptCache];
 	return JSON.stringify(config(a)) !== JSON.stringify(config(b));
 }
 
@@ -254,6 +254,7 @@ export class ModelSourceSync {
 			b.nativeAliases = registerSourceAliases(b.runtime, fallback);
 			if (fallback.length) await b.runtime.refresh({ allowNetwork: false });
 			b.applied = revision;
+			b.failed = !!b.runtime.getError();
 		});
 		return b.tail;
 	}
@@ -318,11 +319,15 @@ export class ModelSourceSync {
 			this.revision++;
 		}
 		this.scan();
-		await Promise.all([...this.bindings].map(async b => { try { await this.apply(b); } catch { /* Retried at next admission; do not leak SDK errors with credentials. */ } b.changed(); }));
+		await Promise.all([...this.bindings].map(async b => { try { await this.apply(b); } catch { b.failed = true; } b.changed(); }));
+	}
+	applicationState(runtime: ModelRuntime): "applied" | "pending" | "application_failed" {
+		const binding = [...this.bindings].find(b => b.runtime === runtime);
+		return binding?.failed ? "application_failed" : binding && binding.applied !== this.revision ? "pending" : "applied";
 	}
 	async ready(runtime: ModelRuntime) {
 		const b = [...this.bindings].find(b => b.runtime === runtime);
-		if (b) { try { await this.apply(b); } catch { throw new Error("模型同步失败，请检查配置后重试"); } }
+		if (b) { try { const before = b.applied; await this.apply(b); b.failed = !!b.runtime.getError(); if (before !== b.applied) b.changed(); } catch { b.failed = true; throw new Error("模型同步失败，请检查配置后重试"); } }
 	}
 	async acquire(runtime: ModelRuntime): Promise<() => void> {
 		const b = [...this.bindings].find(b => b.runtime === runtime);

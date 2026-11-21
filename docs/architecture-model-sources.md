@@ -46,6 +46,12 @@ Pi 1.5.2 的兼容选项在服务商和模型表单中默认收起，允许编�
 
 回归：`tests/pi152-model-compat-test.mjs` 使用本地模拟接口检查实际请求中的空内容、工具历史、缓存键、Anthropic 增量消息线程以及修改 system/tools 后的完整上下文回退；不使用真实账号或产生模型费用。`tests/model-config-preservation-test.mjs` 验证生产读写路径与未知字段保留；`tests/pi152-model-ui-test.mjs` 验证三态控件、重新打开、中英文和窄屏主题，并检查新增代码语言及 Mermaid 饼图、样式和严格模式下禁用回调。
 
+## 原生参数表单（协议 59）
+
+Pi 原生配置走字段编辑器，锁定 SDK 1.5.2 的 provider/model/modelOverride schema 提供结构；表单不以有效目录覆盖原始文件值，不把部署级输出额度写回来源。字段补丁只修改声明目标，JSONC 注释及未涉及配置保留。保存返回已应用、待应用、已写盘但应用失败或校验/版本冲突；来源 sync 的既有空闲队列负责应用，运行中的任务不被中断。
+
+外部同步条目沿用本节已有窄字段表单和本地副本语义，不扩展成第三方全配置编辑。Pi 高级配置不再经整组聊天模型替换接口写入。
+
 ## 执行边界
 
 主聊天与独立 Wiki 客户端、SSH 节点绑定同一目录；子代理沿用父模型运行时。工具、扩展与 SSH 隔离不变。注册通过公开 registerProvider/setRuntimeApiKey，不把外部 apiKey 放入 SDK 命令解析字段；header 的 `$` 在注册边界转义为字面内容。

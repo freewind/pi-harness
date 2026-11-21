@@ -630,7 +630,7 @@ export class ClientSession {
 				this.sources = modelSourcesFor(this.stateStore.dataDir, this.agentDir);
 				this.sourceUnbind = await this.sources.bind(services.modelRuntime,
 					() => [...this.convs.values()].some(c => c.session.isStreaming || isRecovering(c.recovery)),
-					() => { if (this.convs.size && !this.disposed) { void this.listModels(); void this.modelAdmin.listModelsConfig(); this.flushSnapshot(); } });
+					() => { if (this.convs.size && !this.disposed) { this.modelAdmin.modelConfigApplied(); void this.listModels(); void this.modelAdmin.listModelsConfig(); this.flushSnapshot(); } });
 			}
 			// A second native reload invalidates the process-wide extension factory cache.
 			if (refreshResources) { await services.resourceLoader.reload(); refreshResources = false; }
@@ -1577,14 +1577,17 @@ export class ClientSession {
 	listModelsConfig(): Promise<void> {
 		return this.modelAdmin.listModelsConfig();
 	}
+	getModelConfigEditor(providerId: string, reqId: number): Promise<void> { return this.modelAdmin.getModelConfigEditor(providerId, reqId); }
+	saveModelConfigPatch(providerId: string, reqId: number, version: string, changes: import("./protocol.js").ModelConfigChange[]): Promise<void> { return this.modelAdmin.saveModelConfigPatch(providerId, reqId, version, changes); }
 	fetchModelsList(
 		reqId: number,
 		baseUrl: string,
 		apiKey?: string,
 		authHeader?: boolean,
 		api?: string,
+		providerId?: string,
 	): Promise<void> {
-		return this.modelAdmin.fetchModelsList(reqId, baseUrl, apiKey, authHeader, api);
+		return this.modelAdmin.fetchModelsList(reqId, baseUrl, apiKey, authHeader, api, providerId);
 	}
 	refreshProviderModels(providerId: string, reqId: number): Promise<void> {
 		return this.modelAdmin.refreshProviderModels(providerId, reqId);

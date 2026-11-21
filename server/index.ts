@@ -873,6 +873,12 @@ wss.on("connection", (ws) => {
 			case "sync_model_sources":
 				void cs.syncModelSources(msg.source, msg.enabled, msg.restore);
 				break;
+			case "get_model_config_editor":
+				void cs.getModelConfigEditor(msg.providerId, msg.reqId);
+				break;
+			case "save_model_config_patch":
+				void cs.saveModelConfigPatch(msg.providerId, msg.reqId, msg.version, msg.changes);
+				break;
 			case "list_models_config":
 				void cs.listModelsConfig();
 				break;
@@ -892,6 +898,7 @@ wss.on("connection", (ws) => {
 					msg.apiKey,
 					msg.authHeader,
 					msg.api,
+					msg.providerId,
 				);
 				break;
 			case "refresh_provider_models":

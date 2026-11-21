@@ -151,24 +151,12 @@ try {
 	await c.waitFor("ready", 8000);
 
 	// 0) save a provider with ONE manual row (hand-tuned metadata)
-	c.send({
-		type: "save_model_config",
-		providerId: "my-provider",
-		config: {
-			providerId: "my-provider",
-			api: "openai-completions",
-			baseUrl: `http://127.0.0.1:${MOCK_PORT}`,
-			apiKey: "saved-secret-key",
-			models: [
-				{
-					id: "mock-a",
-					name: "Manual A",
-					contextWindow: 123456,
-					input: ["text"],
-				},
-			],
-		},
-	});
+	c.send({ type: "get_model_config_editor", providerId: "", reqId: 101 });
+	const edit = await c.waitFor("model_config_editor_result", 10000, m => m.reqId === 101);
+	c.send({ type: "save_model_config_patch", providerId: "my-provider", version: edit.snapshot.version, reqId: 102, changes: [
+		{ target: { kind: "provider" }, operations: Object.entries({ api: "openai-completions", baseUrl: `http://127.0.0.1:${MOCK_PORT}`, apiKey: "saved-secret-key" }).map(([key, value]) => ({ op: "set", path: [key], value })) },
+		{ target: { kind: "model", id: "mock-a" }, operations: Object.entries({ name: "Manual A", contextWindow: 123456, input: ["text"] }).map(([key, value]) => ({ op: "set", path: [key], value })) },
+	] });
 	await c.waitFor("models_config", 10000, (m) =>
 		m.providers.some((p) => p.providerId === "my-provider"),
 	);

@@ -1,4 +1,5 @@
 import { ModelSources } from "./ModelSources";
+import { ModelConfigEditor } from "./ModelConfigEditor";
 import { useDialogFocus } from "../use-dialog-focus";
 import { OpenAIProxySettings } from "./OpenAIProxySettings";
 import { useEffect, useRef, useState } from "react";
@@ -92,16 +93,6 @@ const emptyModel = (): DraftModel => ({
 	maxTokens: "",
 });
 
-const emptyDraft = (): Draft => ({
-	providerId: "",
-	name: "",
-	api: "openai-completions",
-	baseUrl: "",
-	apiKey: "",
-	authHeader: true,
-	models: [emptyModel()],
-});
-
 function toDraft(p: UiProviderConfig): Draft {
 	return {
 		providerId: p.providerId,
@@ -169,6 +160,8 @@ export function ModelConfigModal({
 	const custom = providers.filter(p => matches(p.providerId, p.name));
 	const builtin = providerStatus.filter(p => !providers.some(custom => custom.providerId === p.id) && matches(p.id, p.name));
 	const [editing, setEditing] = useState<Draft | null>(null);
+	const [nativeEditor, setNativeEditor] = useState<{ providerId: string; seed?: UiProviderConfig } | null>(null);
+	const [closeSignal, setCloseSignal] = useState(0);
 	/** Built-in provider rows: providerId → inline key being typed. */
 	const [keys, setKeys] = useState<Record<string, string>>({});
 	const [savingKey, setSavingKey] = useState<string | null>(null);
@@ -353,7 +346,7 @@ export function ModelConfigModal({
 		handledCloneReq.current = cloneProviderResult.reqId;
 		setCloning(null);
 		if (cloneProviderResult.ok && cloneProviderResult.config) {
-			setEditing(toDraft({ ...cloneProviderResult.config, apiKey: "" }));
+			setNativeEditor({ providerId: cloneProviderResult.config.providerId, seed: cloneProviderResult.config });
 		}
 	}, [cloneProviderResult]);
 
@@ -387,30 +380,30 @@ export function ModelConfigModal({
 	};
 
 	return (
-		<div className="modal-backdrop" onClick={onClose}>
+		<div className="modal-backdrop" onClick={() => nativeEditor ? setCloseSignal(value => value + 1) : onClose()}>
 			<div className="modal model-modal" role="dialog" aria-modal="true" aria-label={t("manageModelsTitle")} ref={dialogRef} tabIndex={-1} onClick={(e) => e.stopPropagation()}>
 				<button
 					type="button"
 					className="modal-close"
 					aria-label={t("close")}
-					onClick={onClose}
+					onClick={() => nativeEditor ? setCloseSignal(value => value + 1) : onClose()}
 				>
 					<FiX />
 				</button>
 				<div className="modal-head">
-					<h2>{editing ? t("editProvider") : t("manageModelsTitle")}</h2>
+					<h2>{editing || nativeEditor ? t("editProvider") : t("manageModelsTitle")}</h2>
 				</div>
 
-				{!editing && <div className="model-catalog-toolbar">
+				{!editing && !nativeEditor && <div className="model-catalog-toolbar">
 					<label className="field"><span className="field-label">{t("providerSearch")}</span>
 						<input type="search" value={search} onChange={e => setSearch(e.target.value)} />
 					</label>
-					<button type="button" className="btn primary" onClick={() => setEditing(emptyDraft())}><FiPlus /> {t("addProvider")}</button>
+					<button type="button" className="btn primary" onClick={() => setNativeEditor({ providerId: "" })}><FiPlus /> {t("addProvider")}</button>
 					<span role="status">{t("providerResults", { n: custom.length + builtin.length })}</span>
 				</div>}
 				<div className="model-modal-body">
-				{!editing && <ModelSources sources={sources} send={send} />}
-				{!editing ? (
+				{!editing && !nativeEditor && <ModelSources sources={sources} send={send} />}
+				{nativeEditor ? <ModelConfigEditor providerId={nativeEditor.providerId} seed={nativeEditor.seed} fetchResult={fetchModelsResult} send={send} closeSignal={closeSignal} onBack={() => setNativeEditor(null)} /> : !editing ? (
 					<>
 						{custom.length + builtin.length === 0 && <p className="modal-desc">{t("providerNoResults")}</p>}
 						<div className="form-section-title">{t("customProviders")}</div>
@@ -436,7 +429,7 @@ export function ModelConfigModal({
 											type="button"
 											className="iconbtn"
 											title={t("edit")}
-											onClick={() => setEditing(toDraft(p))}
+											onClick={() => /^sync-[a-f0-9]{24}$/.test(p.providerId) ? setEditing(toDraft(p)) : setNativeEditor({ providerId: p.providerId })}
 										>
 											<FiEdit2 />
 										</button>
@@ -482,6 +475,7 @@ export function ModelConfigModal({
 										</div>
 										<div className="provider-config-section">
 											<h3>{t("providerOtherActions")}</h3>
+											<button className="btn sm" type="button" onClick={() => setNativeEditor({ providerId: p.id })}>{t("mcModelSettings")}</button>
 											<div className="provider-actions">
 												<button type="button" className="btn sm" disabled={cloning !== null} onClick={() => cloneBuiltin(p)}><FiCopy /> {t(cloning === p.id ? "cloning" : "cloneProvider")}</button>
 												{p.configured && p.source === "stored" && <>

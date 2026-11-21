@@ -601,8 +601,10 @@ export type ClientMessage =
 	| { type: "clear_provider_api_key"; provider: string }
 	// -- custom model config (agentDir/models.json) ---------------------------
 	| { type: "list_models_config" }
+	| { type: "get_model_config_editor"; providerId: string; reqId: number }
+	| { type: "save_model_config_patch"; providerId: string; reqId: number; version: string; changes: ModelConfigChange[] }
 	| { type: "sync_model_sources"; source?: ModelSourceId; enabled?: boolean; restore?: boolean }
-	/** Upsert one provider (api/baseUrl/apiKey + its models) into models.json. */
+	/** Edit an external-source local copy. Native models use save_model_config_patch. */
 	| { type: "save_model_config"; providerId: string; config: UiProviderConfig }
 	/** Remove a provider from models.json. */
 	| { type: "delete_model_config"; providerId: string }
@@ -614,6 +616,7 @@ export type ClientMessage =
 	 *  back in fetch_models_result so the UI can match concurrent requests. */
 	| {
 			type: "fetch_models";
+			providerId?: string;
 			reqId: number;
 			baseUrl: string;
 			apiKey?: string;
@@ -857,7 +860,48 @@ export interface ModelInfo {
 // Custom model configuration (agentDir/models.json) — browser-editable shape
 // ---------------------------------------------------------------------------
 
-/** Safe editable compatibility fields. null removes an override; omission preserves it. */
+/** Native configuration values: null is a value; deleting an override is a distinct operation. */
+export type ModelConfigValue = string | number | boolean | null | ModelConfigValue[] | { [key: string]: ModelConfigValue };
+export interface ModelConfigSchema {
+	type?: string;
+	const?: ModelConfigValue;
+	enum?: ModelConfigValue[];
+	properties?: Record<string, ModelConfigSchema>;
+	patternProperties?: Record<string, ModelConfigSchema>;
+	additionalProperties?: boolean | ModelConfigSchema;
+	items?: ModelConfigSchema;
+	anyOf?: ModelConfigSchema[];
+	required?: string[];
+	minimum?: number;
+	maximum?: number;
+	exclusiveMinimum?: number;
+	minLength?: number;
+	default?: ModelConfigValue;
+}
+export interface ModelConfigTarget { kind: "provider" | "model" | "override"; id?: string }
+export interface ModelConfigOperation { op: "set" | "remove"; path: (string | number)[]; value?: ModelConfigValue }
+export interface ModelConfigChange { target: ModelConfigTarget; operations: ModelConfigOperation[]; remove?: boolean }
+export interface ModelConfigEditorSnapshot {
+	providerId: string;
+	version: string;
+	path: string;
+	provider: Record<string, ModelConfigValue>;
+	secretPaths: (string | number)[][];
+	models: { target: ModelConfigTarget; value: Record<string, ModelConfigValue>; effective?: Record<string, ModelConfigValue>; secretPaths: (string | number)[][] }[];
+	schemas: Record<"provider" | "model" | "override", ModelConfigSchema>;
+	compatSchemas: Record<string, ModelConfigSchema>;
+	outputOverride: string | null;
+}
+export type ModelConfigEditorResult = {
+	type: "model_config_editor_result";
+	reqId: number;
+	providerId: string;
+	status: "loaded" | "applied" | "pending" | "application_failed" | "invalid" | "conflict" | "unreadable";
+	snapshot?: ModelConfigEditorSnapshot;
+	field?: string;
+}
+
+/** External-source compatibility fields. null removes an override; omission preserves it. */
 export interface UiModelCompat {
 	supportsMessageThreads?: boolean | null;
 	promptCacheKeyMode?: "auto" | "enabled" | "disabled" | null;
@@ -1241,6 +1285,7 @@ export type ServerMessage =
 			size: number;
 	  }
 	| { type: "models"; models: ModelInfo[]; accounts?: ModelAccount[] }
+	| ModelConfigEditorResult
 	| { type: "models_config"; providers: UiProviderConfig[]; sources?: ModelSourceStatus[] }
 	| { type: "provider_auth"; state: ProviderAuthState }
 	| { type: "providers_status"; providers: ProviderStatus[] }

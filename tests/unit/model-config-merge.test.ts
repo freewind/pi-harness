@@ -1,34 +1,91 @@
 import { describe, expect, it } from "vitest";
-import { mergeChatProvider, readModelCompat } from "../../server/model-config-merge.js";
+import { mergeModelCompat, readModelCompat } from "../../server/model-config-merge.js";
+import { ModelConfigDocument, parseModelConfig, patchModelConfig, projectModelConfig, modelConfigSchemas } from "../../server/model-config-document.js";
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { configOperations, initialConfigValue, schemaForValue } from "../../web/src/model-config-fields.js";
 
 describe("chat provider editing", () => {
 	it("projects only safe compatibility fields including explicit false", () => {
 		expect(readModelCompat({ supportsMessageThreads: false, promptCacheKeyMode: "disabled", headers: { Authorization: "secret" }, futureField: "secret", requiresToolsWithToolHistory: "true" })).toEqual({ supportsMessageThreads: false, promptCacheKeyMode: "disabled" });
 	});
-	it("patches selected compatibility fields and removes only explicit inheritance overrides", () => {
-		const compat = { futureField: { keep: true }, supportsMessageThreads: true, promptCacheKeyMode: "enabled" };
-		const previous = { compat, models: [{ id: "chat", compat }] };
-		const modelCompat = { supportsMessageThreads: false, promptCacheKeyMode: null, requiresToolsWithToolHistory: true } as const;
-		expect(mergeChatProvider(previous, { providerId: "fixture", compat: { supportsMessageThreads: null }, models: [{ id: "chat", compat: modelCompat }] })).toEqual({ compat: { futureField: { keep: true }, promptCacheKeyMode: "enabled" }, models: [{ id: "chat", compat: { futureField: { keep: true }, supportsMessageThreads: false, requiresToolsWithToolHistory: true } }] });
-		expect(mergeChatProvider(previous, { providerId: "fixture", models: [{ id: "chat" }] })).toEqual(previous);
-		expect(mergeChatProvider({}, { providerId: "fixture", compat: { supportsMessageThreads: null }, models: [{ id: "chat" }] })).toEqual({ models: [{ id: "chat" }] });
+	it("keeps external-source compatibility inheritance separate from native null values", () => {
+		const previous = { futureField: { keep: true }, supportsMessageThreads: true, promptCacheKeyMode: "enabled" };
+		expect(mergeModelCompat(previous, { supportsMessageThreads: false, promptCacheKeyMode: null })).toEqual({ futureField: { keep: true }, supportsMessageThreads: false });
+		expect(mergeModelCompat(previous, undefined)).toEqual(previous);
+		expect(() => mergeModelCompat(previous, { supportsMessageThreads: "false" } as never)).toThrow();
 	});
-	it("rejects malformed compatibility input without applying it", () => {
-		const config = JSON.parse('{"providerId":"fixture","models":[{"id":"chat","compat":{"requiresToolsWithToolHistory":"false"}}]}');
-		expect(() => mergeChatProvider({}, config)).toThrow("Invalid compatibility");
+});
+
+
+describe("native model field patches", () => {
+	it("preserves comments, typed rows, credentials and unknown fields when editing leaves", () => {
+		const raw = '{\n // keep comment\n "providers": {"fixture": {"apiKey":"secret", "future":{"keep":true}, "models":[{"id":"shared","type":"image"},{"id":"shared","reasoning":true,"samplingParams":{"temperature":0.4},"futureField":"keep"},{"id":"classify","type":"classifier"}]}}\n}';
+		const result = patchModelConfig(raw, "fixture", [{ target: { kind: "model", id: "shared" }, operations: [{ op: "set", path: ["reasoning"], value: false }, { op: "set", path: ["samplingParams", "temperature"], value: 0 }, { op: "set", path: ["thinkingLevelMap", "max"], value: null }] }]);
+		expect(result).toContain("// keep comment");
+		const provider = (JSON.parse(result.replace("// keep comment", ""))).providers.fixture;
+		expect(provider.apiKey).toBe("secret");
+		expect(provider.future).toEqual({ keep: true });
+		expect(provider.models[0]).toEqual({ id: "shared", type: "image" });
+		expect(provider.models[1]).toMatchObject({ reasoning: false, samplingParams: { temperature: 0 }, thinkingLevelMap: { max: null }, futureField: "keep" });
+		expect(provider.models[2]).toEqual({ id: "classify", type: "classifier" });
 	});
-	it("preserves typed operations, provider metadata and unknown chat fields", () => {
-		const image = { id: "picture", type: "image", api: "openai-images", maxImages: 3 };
-		const classifier = { id: "label", type: "classifier", samplingParams: { temperature: 0 } };
-		const previous = { headers: { Authorization: "fixture" }, apiKey: "fixture-key", models: [{ id: "chat", type: "chat", cost: { input: 2 }, samplingParams: { temperature: 0.1 } }, image, classifier], operations: { image: { enabled: true } } };
-		const result = mergeChatProvider(previous, { providerId: "fixture", api: "openai-completions", models: [{ id: "chat", name: "Renamed", reasoning: false }] });
-		expect(result).toEqual({ ...previous, api: "openai-completions", models: [{ id: "chat", type: "chat", cost: { input: 2 }, samplingParams: { temperature: 0.1 }, name: "Renamed", reasoning: false }, image, classifier] });
+	it("distinguishes setting null from removing an override and rejects unknown field writes", () => {
+		const raw = JSON.stringify({ providers: { fixture: { models: [{ id: "chat", compat: { supportsMessageThreads: true, futureField: "keep" } }] } } });
+		const result = patchModelConfig(raw, "fixture", [{ target: { kind: "model", id: "chat" }, operations: [{ op: "remove", path: ["compat", "supportsMessageThreads"] }] }]);
+		expect(JSON.parse(result).providers.fixture.models[0].compat).toEqual({ futureField: "keep" });
+		expect(() => patchModelConfig(raw, "fixture", [{ target: { kind: "model", id: "chat" }, operations: [{ op: "set", path: ["compat", "requiresToolsWithToolHistory"], value: "false" }] }])).toThrow();
+		expect(() => patchModelConfig(raw, "fixture", [{ target: { kind: "provider" }, operations: [{ op: "set", path: ["unknown"], value: true }] }])).toThrow();
 	});
-	it("removes deleted chat rows, retaining non-chat rows", () => {
-		expect(mergeChatProvider({ models: [{ id: "old" }, { id: "image", type: "image" }] }, { providerId: "fixture", models: [{ id: "new" }] }).models).toEqual([{ id: "new" }, { id: "image", type: "image" }]);
+	it("deletes only a selected chat row and writes built-in overrides without copying models", () => {
+		const raw = JSON.stringify({ providers: { fixture: { models: [{ id: "shared", type: "image" }, { id: "shared" }] } } });
+		const result = patchModelConfig(raw, "fixture", [{ target: { kind: "model", id: "shared" }, remove: true, operations: [] }, { target: { kind: "override", id: "builtin" }, operations: [{ op: "set", path: ["maxTokens"], value: 1000 }] }]);
+		expect(JSON.parse(result).providers.fixture).toEqual({ models: [{ id: "shared", type: "image" }], modelOverrides: { builtin: { maxTokens: 1000 } } });
 	});
-	it("allows IDs shared across operations and rejects duplicate chat IDs", () => {
-		expect(mergeChatProvider({ models: [{ id: "shared", type: "image" }, { id: "shared", type: "chat", cost: { input: 1 } }] }, { providerId: "fixture", models: [{ id: "shared", name: "Edited" }] }).models).toEqual([{ id: "shared", type: "chat", cost: { input: 1 }, name: "Edited" }, { id: "shared", type: "image" }]);
-		expect(() => mergeChatProvider({}, { providerId: "fixture", models: [{ id: "a" }, { id: " a " }] })).toThrow("Duplicate");
+	it("projects schemas without exposing stored secrets", () => {
+		const secrets: (string | number)[][] = [];
+		const result = projectModelConfig({ apiKey: "secret", headers: { Authorization: "secret-header" }, name: "visible", unknown: "hidden" }, modelConfigSchemas.provider, secrets);
+		expect(result).toEqual({ apiKey: null, headers: { Authorization: null }, name: "visible" });
+		expect(JSON.stringify(result)).not.toContain("secret");
+		expect(secrets).toContainEqual(["headers", "Authorization"]);
+	});
+	it("rejects stale versions and malformed input without changing disk", () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-model-document-"));
+		try {
+			const path = join(directory, "models.json"), service = new ModelConfigDocument(path);
+			writeFileSync(path, '{"providers":{"fixture":{}}}');
+			const opened = service.open("fixture");
+			writeFileSync(path, '{"providers":{"fixture":{"name":"external"}}}');
+			expect(() => service.save("fixture", opened.version, [{ target: { kind: "provider" }, operations: [{ op: "set", path: ["name"], value: "local" }] }])).toThrow("conflict");
+			expect(readFileSync(path, "utf8")).toContain("external");
+			writeFileSync(path, '{ broken');
+			expect(() => service.open("fixture")).toThrow("invalid");
+			expect(() => parseModelConfig("{}")).toThrow("invalid");
+		} finally { rmSync(directory, { recursive: true, force: true }); }
+	});
+});
+
+
+describe("patch identity and provider metadata", () => {
+	it("retains operations and unrelated fields while changing provider metadata", () => {
+		const original = { headers: { Authorization: "fixture" }, apiKey: "fixture-key", models: [{ id: "chat", samplingParams: { temperature: 0.1 } }, { id: "picture", type: "image" }, { id: "label", type: "classifier" }], operations: { image: { enabled: true } } };
+		const result = JSON.parse(patchModelConfig(JSON.stringify({ providers: { fixture: original } }), "fixture", [{ target: { kind: "provider" }, operations: [{ op: "set", path: ["api"], value: "openai-completions" }] }, { target: { kind: "model", id: "chat" }, operations: [{ op: "set", path: ["name"], value: "Renamed" }, { op: "set", path: ["reasoning"], value: false }] }])).providers.fixture;
+		expect(result).toEqual({ ...original, api: "openai-completions", models: [{ ...original.models[0], name: "Renamed", reasoning: false }, ...original.models.slice(1)] });
+	});
+	it("rejects ambiguous duplicate chat definitions and preserves a no-op document byte for byte", () => {
+		const raw = JSON.stringify({ providers: { fixture: { models: [{ id: "a" }, { id: "a" }] } } });
+		expect(() => patchModelConfig(raw, "fixture", [{ target: { kind: "model", id: "a" }, operations: [{ op: "set", path: ["name"], value: "Edited" }] }])).toThrow();
+		expect(patchModelConfig(raw, "fixture", [])).toBe(raw);
+	});
+});
+
+
+describe("model form draft semantics", () => {
+	it("uses leaf removals instead of replacing known objects and preserves explicit values", () => {
+		expect(configOperations({ compat: { supportsStore: true } }, {})).toEqual([{ op: "remove", path: ["compat", "supportsStore"] }]);
+		expect(configOperations({ reasoning: true, samplingParams: { temperature: 1 } }, { reasoning: false, samplingParams: { temperature: 0 }, thinkingLevelMap: { max: null } })).toEqual([{ op: "set", path: ["reasoning"], value: false }, { op: "set", path: ["samplingParams", "temperature"], value: 0 }, { op: "set", path: ["thinkingLevelMap"], value: { max: null } }]);
+		expect(initialConfigValue(modelConfigSchemas.model.properties!.cost)).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+		expect(schemaForValue({ anyOf: [{ type: "string" }, { type: "null" }] }, null)).toEqual({ type: "null" });
 	});
 });
